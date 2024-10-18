@@ -1616,60 +1616,113 @@ namespace ServiceLib.Handler
             return item;
         }
 
+        public static int InitRouting(Config config, bool blImportAdvancedRules = false)
+        {
+            if (string.IsNullOrEmpty(config.constItem.routeRulesTemplateSourceUrl))
+            {
+                InitBuiltinRouting(config, blImportAdvancedRules);
+            }
+            else
+            {
+                InitExternalRouting(config, blImportAdvancedRules);
+            }
+
+            return 0;
+        }
+
+        public static int InitExternalRouting(Config config, bool blImportAdvancedRules = false)
+        {
+            var downloadHandle = new DownloadService();
+            var templateContent = Task.Run(() => downloadHandle.TryDownloadString(config.constItem.routeRulesTemplateSourceUrl, false, "")).Result;
+            if (String.IsNullOrEmpty(templateContent))
+                return InitBuiltinRouting(config, blImportAdvancedRules); // fallback
+
+            var template = JsonUtils.Deserialize<RoutingTemplate>(templateContent);
+            if (template == null)
+                return InitBuiltinRouting(config, blImportAdvancedRules); // fallback
+
+            var items = AppHandler.Instance.RoutingItems();
+            var maxSort = items.Count;
+            if (!blImportAdvancedRules && items.Where(t => t.remarks.StartsWith(template.version)).ToList().Count > 0)
+            {
+                return 0;
+            }
+            for (var i = 0; i < template.routingItems.Length; i++)
+            {
+                var item = template.routingItems[i];
+
+                if (String.IsNullOrEmpty(item.url) && String.IsNullOrEmpty(item.ruleSet))
+                    continue;
+
+                var ruleSetsString = !String.IsNullOrEmpty(item.ruleSet)
+                    ? item.ruleSet
+                    : Task.Run(() => downloadHandle.TryDownloadString(item.url, false, "")).Result;
+
+                if (String.IsNullOrEmpty(ruleSetsString))
+                    continue;
+
+                item.remarks = $"{template.version}-{item.remarks}";
+                item.enabled = true;
+                item.sort = ++maxSort;
+                item.url = string.Empty;
+
+                AddBatchRoutingRules(ref item, ruleSetsString);
+
+                //first rule as default at first startup
+                if (!blImportAdvancedRules && i == 0)
+                {
+                    SetDefaultRouting(config, item);
+                }
+            }
+
+            return 0;
+        }
+
         public static int InitBuiltinRouting(Config config, bool blImportAdvancedRules = false)
         {
             var ver = "V3-";
             var items = AppHandler.Instance.RoutingItems();
-            if (blImportAdvancedRules || items.Where(t => t.remarks.StartsWith(ver)).ToList().Count <= 0)
+            if (!blImportAdvancedRules && items.Where(t => t.remarks.StartsWith(ver)).ToList().Count > 0)
             {
-                var maxSort = items.Count;
-                //Bypass the mainland
-                var item2 = new RoutingItem()
-                {
-                    remarks = $"{ver}绕过大陆(Whitelist)",
-                    url = string.Empty,
-                    sort = maxSort + 1,
-                };
-                AddBatchRoutingRules(ref item2, Utils.GetEmbedText(Global.CustomRoutingFileName + "white"));
-
-                //Blacklist
-                var item3 = new RoutingItem()
-                {
-                    remarks = $"{ver}黑名单(Blacklist)",
-                    url = string.Empty,
-                    sort = maxSort + 2,
-                };
-                AddBatchRoutingRules(ref item3, Utils.GetEmbedText(Global.CustomRoutingFileName + "black"));
-
-                //Global
-                var item1 = new RoutingItem()
-                {
-                    remarks = $"{ver}全局(Global)",
-                    url = string.Empty,
-                    sort = maxSort + 3,
-                };
-                AddBatchRoutingRules(ref item1, Utils.GetEmbedText(Global.CustomRoutingFileName + "global"));
-
-                if (!blImportAdvancedRules)
-                {
-                    SetDefaultRouting(config, item2);
-                }
+                return 0;
             }
 
-            if (GetLockedRoutingItem(config) == null)
+            var maxSort = items.Count;
+            //Bypass the mainland
+            var item2 = new RoutingItem()
             {
-                var item1 = new RoutingItem()
-                {
-                    remarks = "locked",
-                    url = string.Empty,
-                    locked = true,
-                };
-                AddBatchRoutingRules(ref item1, Utils.GetEmbedText(Global.CustomRoutingFileName + "locked"));
+                remarks = $"{ver}绕过大陆(Whitelist)",
+                url = string.Empty,
+                sort = maxSort + 1,
+            };
+            AddBatchRoutingRules(ref item2, Utils.GetEmbedText(Global.CustomRoutingFileName + "white"));
+
+            //Blacklist
+            var item3 = new RoutingItem()
+            {
+                remarks = $"{ver}黑名单(Blacklist)",
+                url = string.Empty,
+                sort = maxSort + 2,
+            };
+            AddBatchRoutingRules(ref item3, Utils.GetEmbedText(Global.CustomRoutingFileName + "black"));
+
+            //Global
+            var item1 = new RoutingItem()
+            {
+                remarks = $"{ver}全局(Global)",
+                url = string.Empty,
+                sort = maxSort + 3,
+            };
+            AddBatchRoutingRules(ref item1, Utils.GetEmbedText(Global.CustomRoutingFileName + "global"));
+
+            if (!blImportAdvancedRules)
+            {
+                SetDefaultRouting(config, item2);
             }
             return 0;
         }
 
-        public static RoutingItem GetLockedRoutingItem(Config config)
+        public static RoutingItem? GetLockedRoutingItem(Config config)
         {
             return SQLiteHelper.Instance.Table<RoutingItem>().FirstOrDefault(it => it.locked == true);
         }
@@ -1708,6 +1761,11 @@ namespace ServiceLib.Handler
 
         public static int SaveDNSItems(Config config, DNSItem item)
         {
+            if (item == null)
+            {
+                return -1;
+            }
+
             if (Utils.IsNullOrEmpty(item.id))
             {
                 item.id = Utils.GetGuid(false);
@@ -1723,6 +1781,65 @@ namespace ServiceLib.Handler
             }
         }
 
+        public static DNSItem GetExternalDNSItem(ECoreType type, string url)
+        {
+            var currentItem = AppHandler.Instance.GetDNSItem(type);
+
+            var downloadHandle = new DownloadService();
+            var templateContent = Task.Run(() => downloadHandle.TryDownloadString(url, true, "")).Result;
+            if (String.IsNullOrEmpty(templateContent))
+                return currentItem;
+
+            var template = JsonUtils.Deserialize<DNSItem>(templateContent);
+            if (template == null)
+                return currentItem;
+
+            if (!String.IsNullOrEmpty(template.normalDNS))
+                template.normalDNS = Task.Run(() => downloadHandle.TryDownloadString(template.normalDNS, true, "")).Result;
+
+            if (!String.IsNullOrEmpty(template.tunDNS))
+                template.tunDNS = Task.Run(() => downloadHandle.TryDownloadString(template.tunDNS, true, "")).Result;
+
+            template.id = currentItem.id;
+            template.enabled = currentItem.enabled;
+            template.remarks = currentItem.remarks;
+            template.coreType = type;
+
+            return template;
+        }
+
         #endregion DNS
+
+        #region Regional Presets
+
+        public static bool ApplyRegionalPreset(Config config, EPresetType type)
+        {
+            switch (type)
+            {
+                case EPresetType.Default:
+                    config.constItem.geoSourceUrl = "";
+                    config.constItem.srsSourceUrl = "";
+                    config.constItem.routeRulesTemplateSourceUrl = "";
+
+                    SQLiteHelper.Instance.DeleteAll<DNSItem>();
+                    InitBuiltinDNS(config);
+
+                    return true;
+
+                case EPresetType.Russia:
+                    config.constItem.geoSourceUrl = Global.GeoFilesSources[1];
+                    config.constItem.srsSourceUrl = Global.SingboxRulesetSources[1];
+                    config.constItem.routeRulesTemplateSourceUrl = Global.RoutingRulesSources[1];
+
+                    SaveDNSItems(config, GetExternalDNSItem(ECoreType.Xray, Global.DNSTemplateSources[1] + "v2ray.json"));
+                    SaveDNSItems(config, GetExternalDNSItem(ECoreType.sing_box, Global.DNSTemplateSources[1] + "sing_box.json"));
+
+                    return true;
+            }
+
+            return false;
+        }
+
+        #endregion Regional Presets
     }
 }
